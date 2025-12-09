@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Blackline Remover by Emil Ferdman - PyQt6 GUI (Optimized Version)
+Blackline Remover by Emil Ferdman - PyQt6 GUI (Optimized Version with Preview)
 
 Features:
 - Delete red text and green strikethrough text
@@ -10,6 +10,7 @@ Features:
 - Drag & drop .docx files, or browse and select multiple files
 - Adjustable color tolerances and target RGB colors (via color pickers)
 - Process to cleaned .docx OR to PDF (requires docx2pdf)
+- PREVIEW mode: Shows what will be deleted (light red highlight) and cleaned (cyan highlight)
 - Prompt to open processed file / output folder after completion
 
 Optimizations applied:
@@ -213,16 +214,19 @@ class WordColorProcessor:
     __slots__ = (
         'red_tolerance', 'green_tolerance', 'blue_tolerance',
         'check_simulated_lines', 'RED', 'GREEN', 'BLUE',
-        'stats', 'parent_map', 'paragraph_shapes', 'greenshape_striked_runs'
+        'stats', 'parent_map', 'paragraph_shapes', 'greenshape_striked_runs',
+        'preview_mode'
     )
 
     def __init__(self, red_tolerance=10, green_tolerance=10, blue_tolerance=10,
                  check_simulated_lines=True,
-                 red_color='#FF0000', green_color='#008000', blue_color='#0000FF'):
+                 red_color='#FF0000', green_color='#008000', blue_color='#0000FF',
+                 preview_mode=False):
         self.red_tolerance = red_tolerance
         self.green_tolerance = green_tolerance
         self.blue_tolerance = blue_tolerance
         self.check_simulated_lines = check_simulated_lines
+        self.preview_mode = preview_mode
 
         # Target colors (store as 'RRGGBB')
         self.RED = red_color.lstrip('#').upper()
@@ -262,7 +266,10 @@ class WordColorProcessor:
             doc_path = os.path.join(extract_dir, 'word', 'document.xml')
 
             if progress_callback:
-                progress_callback("Processing document content...")
+                if self.preview_mode:
+                    progress_callback("Generating preview (highlighting changes)...")
+                else:
+                    progress_callback("Processing document content...")
             if progress_value_callback:
                 progress_value_callback(20)
 
@@ -311,29 +318,39 @@ class WordColorProcessor:
             progress_value_callback(40)
 
         if progress_callback:
-            progress_callback("Processing text runs...")
+            if self.preview_mode:
+                progress_callback("Highlighting text runs for preview...")
+            else:
+                progress_callback("Processing text runs...")
 
         self.process_element(root)
 
         if progress_value_callback:
             progress_value_callback(50)
 
-        if progress_callback:
-            progress_callback("Removing colored graphical shapes...")
+        # In preview mode, we highlight shapes instead of removing them
+        if not self.preview_mode:
+            if progress_callback:
+                progress_callback("Removing colored graphical shapes...")
 
-        # Rebuild parent map only if structure changed significantly
-        self.parent_map = {c: p for p in root.iter() for c in p}
-        self.remove_colored_shapes(root)
+            # Rebuild parent map only if structure changed significantly
+            self.parent_map = {c: p for p in root.iter() for c in p}
+            self.remove_colored_shapes(root)
 
-        if progress_value_callback:
-            progress_value_callback(70)
+            if progress_value_callback:
+                progress_value_callback(70)
 
-        if progress_callback:
-            progress_callback("Removing empty text boxes...")
+            if progress_callback:
+                progress_callback("Removing empty text boxes...")
 
-        # Rebuild once more for textbox removal
-        self.parent_map = {c: p for p in root.iter() for c in p}
-        self.remove_empty_textboxes(root)
+            # Rebuild once more for textbox removal
+            self.parent_map = {c: p for p in root.iter() for c in p}
+            self.remove_empty_textboxes(root)
+        else:
+            if progress_callback:
+                progress_callback("Skipping shape/textbox removal in preview mode...")
+            if progress_value_callback:
+                progress_value_callback(70)
 
         if progress_value_callback:
             progress_value_callback(85)
@@ -356,21 +373,36 @@ class WordColorProcessor:
         """Recursively process elements, handling text runs."""
         runs_to_remove = []
         runs_to_clean = []
+        runs_to_highlight_delete = []
+        runs_to_highlight_clean = []
 
         for child in list(element):
             self.process_element(child)
             if child.tag == W_R:
                 action = self.analyze_run(child)
-                if action == 'delete':
-                    runs_to_remove.append(child)
-                elif action == 'clean':
-                    runs_to_clean.append(child)
+                if self.preview_mode:
+                    # In preview mode, highlight instead of delete/clean
+                    if action == 'delete':
+                        runs_to_highlight_delete.append(child)
+                    elif action == 'clean':
+                        runs_to_highlight_clean.append(child)
+                else:
+                    if action == 'delete':
+                        runs_to_remove.append(child)
+                    elif action == 'clean':
+                        runs_to_clean.append(child)
 
         # Batch operations (Optimization #4)
-        for r in runs_to_remove:
-            element.remove(r)
-        for r in runs_to_clean:
-            self.clean_run(r)
+        if self.preview_mode:
+            for r in runs_to_highlight_delete:
+                self.highlight_run(r, 'red')   # Light red shading for deletions
+            for r in runs_to_highlight_clean:
+                self.highlight_run(r, 'cyan')  # Cyan highlight for cleaning
+        else:
+            for r in runs_to_remove:
+                element.remove(r)
+            for r in runs_to_clean:
+                self.clean_run(r)
 
     def get_attr(self, elem, name):
         """Get attribute, checking namespaced and non-namespaced versions."""
@@ -378,6 +410,10 @@ class WordColorProcessor:
         if val is None:
             val = elem.get(name)
         return val
+
+    def set_attr(self, elem, name, value):
+        """Set attribute with namespace."""
+        elem.set(f'{W_NS}{name}', value)
 
     def has_strikethrough(self, rPr):
         """Check explicit w:strike / w:dstrike on a run."""
@@ -513,6 +549,42 @@ class WordColorProcessor:
 
         return False
 
+    def highlight_run(self, run, highlight_color):
+        """
+        Apply a highlight color to a run for preview purposes.
+        - For 'red': use a much lighter red via shading fill.
+        - For others: use standard Word highlight colors.
+        """
+        rPr = run.find(W_RPR)
+        if rPr is None:
+            # Create rPr if it doesn't exist
+            rPr = ET.Element(W_RPR)
+            run.insert(0, rPr)
+
+        # Remove existing highlight if present
+        existing_highlight = rPr.find(W_HIGHLIGHT)
+        if existing_highlight is not None:
+            rPr.remove(existing_highlight)
+
+        # Remove existing shading if present (we'll apply our own)
+        existing_shd = rPr.find(W_SHD)
+        if existing_shd is not None:
+            rPr.remove(existing_shd)
+
+        if highlight_color == 'red':
+            # Use a much lighter red background via shading instead of the intense Word 'red' highlight
+            shd_elem = ET.Element(W_SHD)
+            shd_elem.set(f'{W_NS}val', 'clear')
+            shd_elem.set(f'{W_NS}color', 'auto')
+            # Light red fill (pastel)
+            shd_elem.set(f'{W_NS}fill', 'FFC0C0')
+            rPr.append(shd_elem)
+        else:
+            # Standard Word highlight for cyan/others
+            highlight_elem = ET.Element(W_HIGHLIGHT)
+            highlight_elem.set(f'{W_NS}val', highlight_color)
+            rPr.append(highlight_elem)
+
     def clean_run(self, run):
         """Remove color, underline, bold, italic, strikethrough, shading, highlight."""
         rPr = run.find(W_RPR)
@@ -535,43 +607,43 @@ class WordColorProcessor:
     def detect_green_shape_strikes(self, root):
         """
         Detect green drawn lines that act as strikethroughs.
-        
+
         Optimized version using single-pass collection and deferred paragraph lookup.
         """
         self.greenshape_striked_runs = set()
         green_tolerance = self.green_tolerance
         GREEN = self.GREEN
         parent_map = self.parent_map
-        
+
         # Collect paragraphs that contain green strike candidates
         strike_paragraphs = set()
-        
+
         # --- Use XPath for lxml, fallback to iter for ElementTree ---
         if USING_LXML:
             alt_contents = root.xpath('.//mc:AlternateContent', namespaces=NAMESPACES)
         else:
             alt_contents = list(root.iter(MC_ALTCONTENT))
-        
+
         # --- Single-pass collection of all colored elements in AlternateContent ---
         for alt in alt_contents:
             colors_found = []
             has_textbox = False
             vml_shapes = []
-            
+
             for elem in alt.iter():
                 tag = elem.tag
-                
+
                 # Check for textbox content (disqualifies as shape)
                 if tag == W_TXBXCONTENT:
                     has_textbox = True
                     break
-                
+
                 # Collect DrawingML colors
                 if tag == A_SRGBCLR:
                     color_val = elem.get('val')
                     if color_val:
                         colors_found.append(color_val.upper())
-                
+
                 # Collect VML shapes and their colors
                 if tag in VML_SHAPE_TAGS_SET:
                     vml_shapes.append(elem)
@@ -586,52 +658,52 @@ class WordColorProcessor:
                             fillcolor = fill_child.get('color') or fill_child.get('fillcolor')
                     if fillcolor:
                         colors_found.append(fillcolor.lstrip('#').upper())
-            
+
             # Skip if this is a textbox
             if has_textbox:
                 continue
-            
+
             # Skip if no colors found
             if not colors_found:
                 continue
-                
+
             # Check if any color is green
             has_green = False
             for c in colors_found:
                 if is_color_match(c, GREEN, green_tolerance):
                     has_green = True
                     break
-            
+
             if not has_green:
                 continue
-            
+
             # Determine role from VML shapes
             role = 'strike'
             for vshape in vml_shapes:
                 role = self.classify_shape_role(vshape)
                 if role == 'underline':
                     break
-            
+
             if role != 'strike':
                 continue
-            
+
             # Find parent paragraph (deferred until we know it's a valid candidate)
             cur = alt
             while cur is not None and cur.tag != W_P:
                 cur = parent_map.get(cur)
             if cur is not None:
                 strike_paragraphs.add(cur)
-        
+
         # --- Check standalone VML shapes not wrapped in AlternateContent ---
         # Build a set of all AlternateContent elements for quick membership testing
         alt_set = set(alt_contents)
-        
+
         for tag in VML_SHAPE_TAGS[:3]:  # line, shape, rect
             if USING_LXML:
                 vml_shapes = root.xpath(f'.//v:{tag.split("}")[-1]}', namespaces=NAMESPACES)
             else:
                 vml_shapes = list(root.iter(tag))
-            
+
             for vshape in vml_shapes:
                 # Check if inside an AlternateContent (already processed)
                 cur = vshape
@@ -641,14 +713,14 @@ class WordColorProcessor:
                     if cur in alt_set:
                         inside_alt = True
                         break
-                
+
                 if inside_alt:
                     continue
-                
+
                 # Check for textbox child
                 if vshape.find('.//' + V_TEXTBOX) is not None:
                     continue
-                
+
                 # Get fill color
                 fillcolor = (
                     vshape.get('fillcolor') or
@@ -659,28 +731,28 @@ class WordColorProcessor:
                     fill_child = vshape.find('.//' + V_FILL)
                     if fill_child is not None:
                         fillcolor = fill_child.get('color') or fill_child.get('fillcolor')
-                
+
                 if not fillcolor:
                     continue
-                
+
                 if not is_color_match(fillcolor.lstrip('#').upper(), GREEN, green_tolerance):
                     continue
-                
+
                 role = self.classify_shape_role(vshape)
                 if role != 'strike':
                     continue
-                
+
                 # Find parent paragraph
                 cur = vshape
                 while cur is not None and cur.tag != W_P:
                     cur = parent_map.get(cur)
                 if cur is not None:
                     strike_paragraphs.add(cur)
-        
+
         # --- Single pass through strike paragraphs to find green runs ---
         if not strike_paragraphs:
             return
-        
+
         for para in strike_paragraphs:
             for run in para.iter(W_R):
                 rPr = run.find(W_RPR)
@@ -842,6 +914,12 @@ def make_output_pdf(docx_output):
     return str(p.with_suffix(".pdf"))
 
 
+def make_preview_docx(input_path):
+    """Create a path for preview docx in the same folder."""
+    p = Path(input_path)
+    return str(p.parent / f"(Preview) {p.name}")
+
+
 # =============================================================================
 # WORKER THREAD
 # =============================================================================
@@ -956,6 +1034,80 @@ class ProcessorWorker(QObject):
             self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
 
 
+class PreviewWorker(QObject):
+    """Worker for generating preview DOCX files."""
+    progress = pyqtSignal(int)
+    status = pyqtSignal(str)
+    finished = pyqtSignal(str)  # Path to preview DOCX
+    error = pyqtSignal(str)
+
+    def __init__(self, input_file,
+                 red_tolerance, green_tolerance, blue_tolerance,
+                 check_simulated,
+                 red_color, green_color, blue_color,
+                 parent=None):
+        super().__init__(parent)
+        self.input_file = input_file
+        self.red_tolerance = red_tolerance
+        self.green_tolerance = green_tolerance
+        self.blue_tolerance = blue_tolerance
+        self.check_simulated = check_simulated
+        self.red_color = red_color
+        self.green_color = green_color
+        self.blue_color = blue_color
+
+    def run(self):
+        try:
+            self.status.emit("Generating preview...")
+            self.status.emit(f"Input file: {os.path.basename(self.input_file)}")
+            self.progress.emit(5)
+
+            # Create processor in preview mode
+            processor = WordColorProcessor(
+                red_tolerance=self.red_tolerance,
+                green_tolerance=self.green_tolerance,
+                blue_tolerance=self.blue_tolerance,
+                check_simulated_lines=self.check_simulated,
+                red_color=self.red_color,
+                green_color=self.green_color,
+                blue_color=self.blue_color,
+                preview_mode=True
+            )
+
+            # Create preview DOCX with highlights (no PDF conversion)
+            preview_docx = make_preview_docx(self.input_file)
+
+            def progress_callback(msg):
+                self.status.emit(msg)
+
+            def progress_value_callback(val):
+                # Scale 0-100 to 5-70 for the processing phase
+                scaled = 5 + int(val * 0.65)
+                self.progress.emit(scaled)
+
+            self.status.emit("Creating highlighted document...")
+            stats = processor.process_document(
+                self.input_file, preview_docx,
+                progress_callback=progress_callback,
+                progress_value_callback=progress_value_callback
+            )
+
+            self.status.emit(
+                f"Preview stats - Will delete: {stats['red_deleted'] + stats['green_strike_deleted']} runs, "
+                f"Will clean: {stats['green_cleaned'] + stats['blue_cleaned']} runs"
+            )
+
+            # Finalize preview (DOCX only)
+            self.progress.emit(95)
+            self.progress.emit(100)
+            self.status.emit("Preview ready!")
+            self.finished.emit(preview_docx)
+
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+
+
 # =============================================================================
 # GUI COMPONENTS
 # =============================================================================
@@ -989,9 +1141,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Blackline Remover by Emil Ferdman (Optimized)")
-        self.resize(900, 700)
-        self.setMinimumSize(900, 700)
+        self.setWindowTitle("Blackline Remover by Emil Ferdman (Optimized with Preview)")
+        self.resize(900, 750)
+        self.setMinimumSize(900, 750)
         self.setAcceptDrops(True)
 
         self.input_files = []
@@ -1001,6 +1153,11 @@ class MainWindow(QMainWindow):
 
         self.worker_thread = None
         self.worker = None
+        self.preview_thread = None
+        self.preview_worker = None
+
+        # Track preview files so we can clean them up on app close
+        self.preview_files = []
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1076,6 +1233,24 @@ class MainWindow(QMainWindow):
         help_label.setWordWrap(True)
         options_layout.addWidget(help_label)
 
+        # Preview legend
+        legend_layout = QHBoxLayout()
+        options_layout.addLayout(legend_layout)
+
+        legend_label = QLabel("Preview Legend:")
+        legend_label.setStyleSheet("font-weight: bold;")
+        legend_layout.addWidget(legend_label)
+
+        red_legend = QLabel("■ Light red background = Will be DELETED")
+        red_legend.setStyleSheet("color: #CC0000; font-weight: bold;")
+        legend_layout.addWidget(red_legend)
+
+        blue_legend = QLabel("■ Cyan highlight = Will be CLEANED (formatting removed)")
+        blue_legend.setStyleSheet("color: #0088AA; font-weight: bold;")
+        legend_layout.addWidget(blue_legend)
+
+        legend_layout.addStretch()
+
         # Progress group
         progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout(progress_group)
@@ -1090,6 +1265,14 @@ class MainWindow(QMainWindow):
         # Buttons
         buttons_layout = QHBoxLayout()
         main_layout.addLayout(buttons_layout)
+
+        self.preview_btn = QPushButton("Preview Changes")
+        self.preview_btn.setToolTip(
+            "Generate a DOCX preview showing what will be deleted (light red background)\n"
+            "and what will be cleaned (cyan highlight)"
+        )
+        self.preview_btn.clicked.connect(self.start_preview)
+        buttons_layout.addWidget(self.preview_btn)
 
         self.process_docx_btn = QPushButton("Process Document(s)")
         self.process_docx_btn.clicked.connect(lambda: self.start_processing("docx"))
@@ -1210,6 +1393,71 @@ class MainWindow(QMainWindow):
             self.log_edit.verticalScrollBar().maximum()
         )
 
+    def set_buttons_enabled(self, enabled):
+        """Enable or disable all action buttons."""
+        self.preview_btn.setEnabled(enabled)
+        self.process_docx_btn.setEnabled(enabled)
+        self.process_pdf_btn.setEnabled(enabled)
+
+    def start_preview(self):
+        """Generate a preview DOCX showing what will be deleted/cleaned."""
+        if not self.input_files:
+            QMessageBox.warning(self, "No files", "Please select at least one .docx file.")
+            return
+
+        if len(self.input_files) > 1:
+            QMessageBox.information(
+                self,
+                "Preview",
+                "Preview will be generated for the first file only.\n"
+                f"File: {os.path.basename(self.input_files[0])}"
+            )
+
+        self.log_edit.clear()
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Generating preview...")
+        self.set_buttons_enabled(False)
+
+        self.preview_thread = QThread()
+        self.preview_worker = PreviewWorker(
+            input_file=self.input_files[0],
+            red_tolerance=self.red_slider.value(),
+            green_tolerance=self.green_slider.value(),
+            blue_tolerance=self.blue_slider.value(),
+            check_simulated=self.simulated_checkbox.isChecked(),
+            red_color=self.red_color,
+            green_color=self.green_color,
+            blue_color=self.blue_color,
+        )
+        self.preview_worker.moveToThread(self.preview_thread)
+
+        self.preview_thread.started.connect(self.preview_worker.run)
+        self.preview_worker.progress.connect(self.on_worker_progress)
+        self.preview_worker.status.connect(self.on_worker_status)
+        self.preview_worker.finished.connect(self.on_preview_finished)
+        self.preview_worker.error.connect(self.on_worker_error)
+
+        self.preview_worker.finished.connect(self.preview_thread.quit)
+        self.preview_worker.error.connect(self.preview_thread.quit)
+        self.preview_thread.finished.connect(self.preview_thread.deleteLater)
+
+        self.preview_thread.start()
+
+    def on_preview_finished(self, preview_path):
+        """Handle preview completion."""
+        self.log(f"Preview saved to: {preview_path}")
+        self.progress_label.setText("Preview ready!")
+        self.set_buttons_enabled(True)
+
+        # Track preview for later cleanup and delete any older previews now
+        self.cleanup_preview_files(exclude=preview_path)
+        if preview_path not in self.preview_files:
+            self.preview_files.append(preview_path)
+
+        # Open the preview file
+        self.log("Opening preview...")
+        self.open_path(preview_path)
+
     def start_processing(self, mode):
         if not self.input_files:
             QMessageBox.warning(self, "No files", "Please select at least one .docx file.")
@@ -1227,8 +1475,7 @@ class MainWindow(QMainWindow):
         self.log_edit.clear()
         self.progress_bar.setValue(0)
         self.progress_label.setText("Starting...")
-        self.process_docx_btn.setEnabled(False)
-        self.process_pdf_btn.setEnabled(False)
+        self.set_buttons_enabled(False)
 
         self.worker_thread = QThread()
         self.worker = ProcessorWorker(
@@ -1303,15 +1550,13 @@ class MainWindow(QMainWindow):
                 if reply == QMessageBox.StandardButton.Yes:
                     self.open_path(folder)
 
-        self.process_docx_btn.setEnabled(True)
-        self.process_pdf_btn.setEnabled(True)
+        self.set_buttons_enabled(True)
 
     def on_worker_error(self, message):
         self.log(f"ERROR: {message}")
         self.progress_label.setText("Error!")
         self.progress_bar.setValue(0)
-        self.process_docx_btn.setEnabled(True)
-        self.process_pdf_btn.setEnabled(True)
+        self.set_buttons_enabled(True)
         QMessageBox.critical(self, "Error", f"An error occurred:\n{message}")
 
     def open_path(self, path):
@@ -1329,6 +1574,31 @@ class MainWindow(QMainWindow):
                 "Open Failed",
                 f"Could not open:\n{path}\n\nError:\n{e}"
             )
+
+    def cleanup_preview_files(self, exclude=None):
+        """
+        Attempt to delete any preview DOCX files we've created.
+        - If exclude is provided, that path is kept (for the current active preview).
+        - Files that can't be removed (e.g., still open/locked) are kept in the list
+          so we can try again on app close.
+        """
+        remaining = []
+        for p in self.preview_files:
+            if exclude is not None and os.path.abspath(p) == os.path.abspath(exclude):
+                remaining.append(p)
+                continue
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError:
+                # Likely still open/locked; keep it for another attempt later
+                remaining.append(p)
+        self.preview_files = remaining
+
+    def closeEvent(self, event):
+        """On app close, try to clean up any remaining preview DOCX files."""
+        self.cleanup_preview_files()
+        super().closeEvent(event)
 
 
 # =============================================================================

@@ -3,8 +3,9 @@ This is a standalone application that takes a Microsoft Word .docx file input an
 1. Drag & drop
 2. Support for multiple files at once
 3. Lightning fast speed, even for larger documents
-4. option between .docx and .pdf outputs
-5. color customization for which font color you want 1. exclusively deleted 2. deleted for strikethroughs and cleaned for underlines and 3. exclusively cleaned (cleaned meaning color and underlining removed)
+4. Option between .docx and .pdf outputs
+5. Color customization for which font color you want 1. exclusively deleted 2. deleted for strikethroughs and cleaned for underlines and 3. exclusively cleaned (cleaned meaning color and underlining removed)
+6. Preview with highlighting for which sections of the document will be deleted (red) and which sections will be cleaned (blue)
 
 The .exe should be a runnable standalone program. When you run the program, you will get a pop-up saying "Windows Protected Your PC." You will have to press on the "More Info" button, then "Run Anyway." If the .exe runs too slowly, or Windows flags the programs as a false positive, you will need to install Python:
 
